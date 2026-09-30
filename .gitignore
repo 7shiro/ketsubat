@@ -1,0 +1,17 @@
+# 依存関係
+node_modules/
+
+# ビルド成果物・キャッシュ
+.wrangler/
+dist/
+
+# 環境変数・ローカル秘密情報（絶対にコミットしない）
+.dev.vars
+.env
+.env.*
+
+# OS・エディタ生成ファイル
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

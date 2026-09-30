@@ -1,0 +1,21 @@
+name = "ketsubat"
+main = "src/index.ts"
+compatibility_date = "2026-09-02"
+
+# 独自ドメインの割り当て
+routes = [
+  { pattern = "ketsubat.nananest.jp", custom_domain = true }
+]
+
+# Cloudflare R2 バケットバインド
+[[r2_buckets]]
+bucket_name = "ketsubat-images"
+binding = "KETSUBAT_IMAGES"
+
+# Hyperdrive バインディング（Tunnel経由のPostgreSQL接続）
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "0a8d985f9f004717a15f752b6b05584c" # wrangler hyperdrive create で発行されたID
+
+[triggers]
+crons = ["0 11 * * *"] # 毎日 11:00 UTC ＝ 日本時間 20:00
