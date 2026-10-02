@@ -2,7 +2,7 @@
 
 LINEを通じて漫画の原稿制作や作画練習（クロッキー・デッサン等）の進捗を自動管理し、締め切り遵守と習慣化をサポートするセルフペナルティ型タスク管理システムです。
 
-Cloudflare Workers、Hyperdrive(PostgreSQL)、R2ストレージ、および **Gemini API (3.6-flash)** を組み合わせた完全サーバーレス構成で動作します。
+Cloudflare Workers、R2ストレージ、Gemini API (3.6-flash) によるサーバーレスなエッジ実行環境と、VPS上のPostgreSQL（Hyperdrive経由で高速接続）を組み合わせたハイブリッド構成で動作します。
 
 ---
 
