@@ -32,14 +32,10 @@ export default {
     return new Response('OK', { status: 200 });
   },
 
-  // -------------------------------------------------------------
-  // 2. Cron Trigger (毎夜20:00 締め切り監視＆ペナルティ判定＋次回タスク自動作成)
-  // -------------------------------------------------------------
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
 
-    // 締め切り時刻を過ぎたタスクを取得（COMPLETED / PENDING どちらも取得）
     const expiredTasks = await client.query(
       `SELECT id, task_name, required_count, is_recurring, interval_days, deadline, status 
        FROM tasks 
@@ -47,7 +43,6 @@ export default {
     );
 
     for (const task of expiredTasks.rows) {
-      // まだ PENDING のタスクのみ勝敗判定を行う
       if (task.status === 'PENDING') {
         const subRes = await client.query(
           `SELECT COUNT(*) FROM submissions WHERE task_id = $1 AND submission_type = 'MANUSCRIPT'`,
@@ -78,7 +73,6 @@ export default {
         }
       }
 
-      // 🔁 繰り返しタスクの場合は次回タスクを生成（アクティブなタスクがまだ存在しない場合のみ作成）
       if (task.is_recurring) {
         const activeCheck = await client.query(
           `SELECT id FROM tasks WHERE task_name = $1 AND status = 'PENDING' AND deadline > NOW()`,
@@ -121,7 +115,6 @@ async function handleLineWebhook(bodyText: string, env: Env) {
         const text: string = event.message.text.trim();
         const replyToken = event.replyToken;
 
-        // A-1. タスク提出ターゲットの選択命令（例: 「提出 クロッキー」）
         if (text.startsWith('提出')) {
           const keyword = text.replace(/^提出\s*/, '').trim();
 
@@ -164,7 +157,6 @@ async function handleLineWebhook(bodyText: string, env: Env) {
           continue;
         }
 
-        // A-2. 「タスク一覧」の表示要求
         if (text === 'タスク一覧' || text === 'タスクリスト') {
           const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
           await client.connect();
@@ -201,7 +193,6 @@ async function handleLineWebhook(bodyText: string, env: Env) {
           continue;
         }
 
-        // A-3. 「タスク登録」処理
         const match = text.match(/^タスク登録\s+(.+)\s+(\d+)枚\s+(\d+)日後(?:\s+(?:(毎日)|(\d+)日)(?:繰り返し|ごと))?$/);
 
         if (match) {
@@ -246,7 +237,7 @@ async function handleLineWebhook(bodyText: string, env: Env) {
       }
 
       // ---------------------------------------------------------
-      // B. 画像メッセージ受信
+      // B. 画像メッセージ受信 (排他制御付き)
       // ---------------------------------------------------------
       if (event.type === 'message' && event.message.type === 'image') {
         const messageId = event.message.id;
@@ -298,63 +289,84 @@ async function handleLineWebhook(bodyText: string, env: Env) {
           continue;
         }
 
-        let currentTask: { id: number; task_name: string; required_count: number } | null = null;
+        // 🔒 トランザクション開始＆行ロックで排他制御
+        try {
+          await client.query('BEGIN');
 
-        const stateRes = await client.query(
-          `SELECT t.id, t.task_name, t.required_count FROM user_states us
-           JOIN tasks t ON us.selected_task_id = t.id
-           WHERE us.user_id = $1 AND t.status = 'PENDING' AND t.deadline > NOW()`,
-          [userId]
-        );
+          let currentTask: { id: number; task_name: string; required_count: number } | null = null;
 
-        if (stateRes.rows.length > 0) {
-          currentTask = stateRes.rows[0];
-        } else {
-          const taskRes = await client.query(
-            `SELECT id, task_name, required_count FROM tasks WHERE status = 'PENDING' AND deadline > NOW() ORDER BY deadline ASC LIMIT 1`
+          // 対象タスクを FOR UPDATE でロックして順次処理させる
+          const stateRes = await client.query(
+            `SELECT t.id, t.task_name, t.required_count FROM user_states us
+             JOIN tasks t ON us.selected_task_id = t.id
+             WHERE us.user_id = $1 AND t.status = 'PENDING' AND t.deadline > NOW()
+             FOR UPDATE OF t`,
+            [userId]
           );
-          if (taskRes.rows.length > 0) {
-            currentTask = taskRes.rows[0];
-          }
-        }
 
-        if (!currentTask) {
+          if (stateRes.rows.length > 0) {
+            currentTask = stateRes.rows[0];
+          } else {
+            const taskRes = await client.query(
+              `SELECT id, task_name, required_count FROM tasks 
+               WHERE status = 'PENDING' AND deadline > NOW() 
+               ORDER BY deadline ASC LIMIT 1 
+               FOR UPDATE`,
+            );
+            if (taskRes.rows.length > 0) {
+              currentTask = taskRes.rows[0];
+            }
+          }
+
+          if (!currentTask) {
+            await client.query('ROLLBACK');
+            await replyLine(
+              replyToken, 
+              `⚠️ 現在進行中のアクティブなタスクが見つかりません。`, 
+              env.LINE_CHANNEL_ACCESS_TOKEN
+            );
+            await client.end();
+            continue;
+          }
+
+          // R2へ画像保存
+          const r2Key = `tasks/${currentTask.id}/${Date.now()}_${Math.random().toString(36).substring(2, 7)}.jpg`;
+          await env.KETSUBAT_IMAGES.put(r2Key, imgBuffer, { httpMetadata: { contentType: 'image/jpeg' } });
+
+          // 提出物をインサート
+          await client.query(
+            `INSERT INTO submissions (task_id, r2_key, submission_type, stage) VALUES ($1, $2, 'MANUSCRIPT', $3)`,
+            [currentTask.id, r2Key, aiResult.stage_or_amount]
+          );
+
+          // 最新件数を取得（先行トランザクションのコミット分が正しく加算される）
+          const countRes = await client.query(
+            `SELECT COUNT(*) FROM submissions WHERE task_id = $1 AND submission_type = 'MANUSCRIPT'`,
+            [currentTask.id]
+          );
+          const currentCount = parseInt(countRes.rows[0].count, 10);
+
+          let isClearedMsg = '';
+          if (currentCount >= currentTask.required_count) {
+            await client.query(`UPDATE tasks SET status = 'COMPLETED' WHERE id = $1`, [currentTask.id]);
+            isClearedMsg = `\n🎉 目標枚数を達成しました！`;
+          }
+
+          // トランザクションをコミットして次のリクエストへバトンタッチ
+          await client.query('COMMIT');
+          await client.end();
+
           await replyLine(
             replyToken, 
-            `⚠️ 現在進行中のアクティブなタスクが見つかりません。`, 
+            `✅ 【原稿審査合格 (${aiResult.stage_or_amount})】\n──────────\n対象タスク：${currentTask.task_name}\n提出数：${currentCount}/${currentTask.required_count}枚${isClearedMsg}\n判定理由：${aiResult.reason}`, 
             env.LINE_CHANNEL_ACCESS_TOKEN
           );
+
+        } catch (dbErr) {
+          await client.query('ROLLBACK');
           await client.end();
-          continue;
+          throw dbErr;
         }
-
-        const r2Key = `tasks/${currentTask.id}/${Date.now()}.jpg`;
-        await env.KETSUBAT_IMAGES.put(r2Key, imgBuffer, { httpMetadata: { contentType: 'image/jpeg' } });
-
-        await client.query(
-          `INSERT INTO submissions (task_id, r2_key, submission_type, stage) VALUES ($1, $2, 'MANUSCRIPT', $3)`,
-          [currentTask.id, r2Key, aiResult.stage_or_amount]
-        );
-
-        const countRes = await client.query(
-          `SELECT COUNT(*) FROM submissions WHERE task_id = $1 AND submission_type = 'MANUSCRIPT'`,
-          [currentTask.id]
-        );
-        const currentCount = parseInt(countRes.rows[0].count, 10);
-
-        let isClearedMsg = '';
-        if (currentCount >= currentTask.required_count) {
-          await client.query(`UPDATE tasks SET status = 'COMPLETED' WHERE id = $1`, [currentTask.id]);
-          isClearedMsg = `\n🎉 目標枚数を達成しました！`;
-        }
-
-        await client.end();
-
-        await replyLine(
-          replyToken, 
-          `✅ 【原稿審査合格 (${aiResult.stage_or_amount})】\n──────────\n対象タスク：${currentTask.task_name}\n提出数：${currentCount}/${currentTask.required_count}枚${isClearedMsg}\n判定理由：${aiResult.reason}`, 
-          env.LINE_CHANNEL_ACCESS_TOKEN
-        );
       }
     }
   } catch (err) {
